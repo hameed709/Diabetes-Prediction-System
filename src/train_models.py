@@ -1,144 +1,227 @@
 # src/train_models.py
 """
-Robust training script for Diabetes project.
+Training pipeline for Diabetes Risk Screening (AegisDiab™)
 
-Improvements:
-- Select numeric columns explicitly.
-- Drop numeric columns that are all-NaN in the TRAIN set (can't impute them).
-- Ensure the same numeric column set is used for test (add missing cols as 0).
-- Impute remaining numeric NaNs with median and persist the imputer.
-- Train multiple models and save them.
+✔ Feature engineering INSIDE pipeline (Age_bin, BMI_category, Glucose_category)
+✔ Recall-first threshold optimization
+✔ Class imbalance handled
+✔ Calibrated probabilities
+✔ Single portable pipeline saved as best_model.pkl
 """
 
-import os
-import pandas as pd
-import numpy as np
+import json
 import joblib
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+from feature_engineering import FeatureEngineer
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-from xgboost import XGBClassifier
-from sklearn.svm import SVC
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.neural_network import MLPClassifier
-from sklearn.metrics import accuracy_score
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import (
+    roc_auc_score,
+    recall_score,
+    accuracy_score,
+    precision_score,
+    f1_score
+)
 
-PROC_DIR = os.path.join("data", "processed")
-MODELS_DIR = "models"
-os.makedirs(MODELS_DIR, exist_ok=True)
+# Optional XGBoost
+try:
+    from xgboost import XGBClassifier
+    HAS_XGB = True
+except Exception:
+    HAS_XGB = False
 
-def load_processed():
-    X_train = pd.read_csv(os.path.join(PROC_DIR, "X_train.csv"))
-    X_test = pd.read_csv(os.path.join(PROC_DIR, "X_test.csv"))
-    y_train = pd.read_csv(os.path.join(PROC_DIR, "y_train.csv"))
-    y_test = pd.read_csv(os.path.join(PROC_DIR, "y_test.csv"))
+# ------------------------------------------------------------
+# CONFIG
+# ------------------------------------------------------------
+DATA_PATH = Path("data") / "processed" / "improved_pima_diabetes_clean.csv"
+TARGET_COL = "Outcome"
 
-    # Normalize y series
-    if "Outcome" in y_train.columns:
-        y_train = y_train["Outcome"]
-    else:
-        y_train = y_train.iloc[:,0]
+MODELS_DIR = Path("models")
+MODELS_DIR.mkdir(exist_ok=True)
 
-    if "Outcome" in y_test.columns:
-        y_test = y_test["Outcome"]
-    else:
-        y_test = y_test.iloc[:,0]
+RANDOM_STATE = 42
+TEST_SIZE = 0.2
+VAL_SIZE = 0.2
+MIN_RECALL = 0.70
 
-    return X_train, X_test, y_train, y_test
 
-def prepare_numeric(X_train_df, X_test_df):
-    # Choose numeric columns explicitly
-    numeric_cols = [c for c in X_train_df.columns if pd.api.types.is_numeric_dtype(X_train_df[c])]
-    if len(numeric_cols) == 0:
-        raise ValueError("No numeric columns found in X_train.csv. Check processed data.")
+# ------------------------------------------------------------
+# UTILITIES
+# ------------------------------------------------------------
+def load_data(path: Path):
+    if not path.exists():
+        raise FileNotFoundError(f"Dataset not found: {path}")
+    df = pd.read_csv(path)
+    if TARGET_COL not in df.columns:
+        raise ValueError(f"Target column '{TARGET_COL}' not found")
+    return df
 
-    Xtr_num = X_train_df[numeric_cols].copy()
-    Xte_num = X_test_df[numeric_cols].copy()  # if test lacks a numeric col, this will KeyError; we'll handle below
+def compute_best_threshold(pipe, X_val, y_val, min_recall=MIN_RECALL):
+    probs = pipe.predict_proba(X_val)[:, 1]
 
-    # Identify numeric cols that are entirely NaN in training set and drop them
-    cols_all_nan = [c for c in numeric_cols if Xtr_num[c].isna().all()]
-    if cols_all_nan:
-        print("Dropping numeric columns that are all-NaN in training data:", cols_all_nan)
-        Xtr_num = Xtr_num.drop(columns=cols_all_nan)
-        # Also drop from numeric_cols list
-        numeric_cols = [c for c in numeric_cols if c not in cols_all_nan]
+    for t in np.linspace(0.05, 0.5, 50):
+        preds = (probs >= t).astype(int)
+        if recall_score(y_val, preds) >= min_recall:
+            return float(t)
 
-    # Ensure test has the same numeric columns. If test lacks columns, create them filled with NaN.
-    for c in numeric_cols:
-        if c not in Xte_num.columns:
-            Xte_num[c] = np.nan
+    return 0.15
 
-    # Reorder test columns to match train
-    Xte_num = Xte_num[numeric_cols]
+# ------------------------------------------------------------
+# MODEL PIPELINES
+# ------------------------------------------------------------
+def build_pipelines():
+    base_steps = [
+        ("features", FeatureEngineer()),
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
+    ]
 
-    # Impute numeric NaNs with median
-    imputer = SimpleImputer(strategy="median")
-    Xtr_imp_array = imputer.fit_transform(Xtr_num)
-    Xte_imp_array = imputer.transform(Xte_num)
+    pipes = {
+        "logistic": Pipeline(base_steps + [
+            ("clf", LogisticRegression(
+                max_iter=1000,
+                solver="liblinear",
+                class_weight={0: 1, 1: 3}
+            ))
+        ]),
+        "decision_tree": Pipeline(base_steps + [
+            ("clf", DecisionTreeClassifier(
+                random_state=RANDOM_STATE,
+                class_weight={0: 1, 1: 3}
+            ))
+        ]),
+        "random_forest": Pipeline(base_steps + [
+            ("clf", RandomForestClassifier(
+                n_estimators=300,
+                random_state=RANDOM_STATE,
+                class_weight={0: 1, 1: 3}
+            ))
+        ]),
+        "gradient_boost": Pipeline(base_steps + [
+            ("clf", GradientBoostingClassifier(
+                n_estimators=300,
+                random_state=RANDOM_STATE
+            ))
+        ]),
+        "mlp": Pipeline(base_steps + [
+            ("clf", MLPClassifier(
+                hidden_layer_sizes=(64, 32),
+                max_iter=500,
+                random_state=RANDOM_STATE
+            ))
+        ])
+    }
 
-    # Convert back to DataFrame
-    Xtr_imp = pd.DataFrame(Xtr_imp_array, columns=numeric_cols, index=Xtr_num.index)
-    Xte_imp = pd.DataFrame(Xte_imp_array, columns=numeric_cols, index=Xte_num.index)
+    if HAS_XGB:
+        pipes["xgboost"] = Pipeline(base_steps + [
+            ("clf", XGBClassifier(
+                n_estimators=300,
+                eval_metric="logloss",
+                random_state=RANDOM_STATE
+            ))
+        ])
 
-    # Save imputer
-    joblib.dump(imputer, os.path.join(MODELS_DIR, "train_imputer.pkl"))
+    return pipes
 
-    return Xtr_imp.values, Xte_imp.values, numeric_cols
+# ------------------------------------------------------------
+# TRAINING
+# ------------------------------------------------------------
+def main():
+    df = load_data(DATA_PATH)
 
-def train_and_save():
-    X_train_df, X_test_df, y_train, y_test = load_processed()
-    print("Loaded processed datasets.")
-    print("X_train shape:", X_train_df.shape, "X_test shape:", X_test_df.shape)
-    print("y_train distribution:\n", y_train.value_counts())
+    X = df.drop(columns=[TARGET_COL])
+    y = df[TARGET_COL].astype(int)
 
-    X_train, X_test, numeric_cols = prepare_numeric(X_train_df, X_test_df)
-    print("Training with numeric columns:", numeric_cols)
-    # Safety: ensure no NaNs remain (after imputation)
-    if np.isnan(X_train).any() or np.isnan(X_test).any():
-        print("Warning: NaNs still present after imputation. Converting NaNs to 0 as last resort.")
-        X_train = np.nan_to_num(X_train)
-        X_test = np.nan_to_num(X_test)
+    X_trainval, X_test, y_trainval, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, stratify=y, random_state=RANDOM_STATE
+    )
 
-    results = []
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_trainval, y_trainval, test_size=VAL_SIZE,
+        stratify=y_trainval, random_state=RANDOM_STATE
+    )
 
-    # Logistic Regression
-    print("Training LogisticRegression...")
-    lr = LogisticRegression(max_iter=1000)
-    lr.fit(X_train, y_train)
-    joblib.dump(lr, os.path.join(MODELS_DIR, "logistic.pkl"))
-    results.append(("Logistic", accuracy_score(y_test, lr.predict(X_test))))
+    pipelines = build_pipelines()
 
-    # Random Forest
-    print("Training RandomForest...")
-    rf = RandomForestClassifier(n_estimators=200, random_state=42)
-    rf.fit(X_train, y_train)
-    joblib.dump(rf, os.path.join(MODELS_DIR, "random_forest.pkl"))
-    results.append(("RandomForest", accuracy_score(y_test, rf.predict(X_test))))
+    best_name = None
+    best_recall = -1
+    best_pipe = None
+    best_thr = None
 
-    # XGBoost
-    print("Training XGBoost...")
-    xgb = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
-    xgb.fit(X_train, y_train)
-    joblib.dump(xgb, os.path.join(MODELS_DIR, "xgb.pkl"))
-    results.append(("XGBoost", accuracy_score(y_test, xgb.predict(X_test))))
+    for name, pipe in pipelines.items():
+        print(f"\nTraining {name} ...")
+        pipe.fit(X_tr, y_tr)
 
-    # SVM
-    print("Training SVM...")
-    svc = SVC(probability=True)
-    svc.fit(X_train, y_train)
-    joblib.dump(svc, os.path.join(MODELS_DIR, "svm.pkl"))
-    results.append(("SVM", accuracy_score(y_test, svc.predict(X_test))))
+        probs = pipe.predict_proba(X_val)[:, 1]
+        auc = roc_auc_score(y_val, probs)
 
-    # MLP
-    print("Training MLP...")
-    mlp = MLPClassifier(hidden_layer_sizes=(64,32), max_iter=500, random_state=42)
-    mlp.fit(X_train, y_train)
-    joblib.dump(mlp, os.path.join(MODELS_DIR, "mlp.pkl"))
-    results.append(("MLP", accuracy_score(y_test, mlp.predict(X_test))))
+        thr = compute_best_threshold(pipe, X_val, y_val)
+        preds = (probs >= thr).astype(int)
+        recall = recall_score(y_val, preds)
 
-    # Save summary
-    df_summary = pd.DataFrame(results, columns=["model", "accuracy"])
-    df_summary.to_csv(os.path.join(MODELS_DIR, "models_summary.csv"), index=False)
-    print("Training complete. Models saved in models/.")
+        print(f"{name:14} AUC={auc:.4f}  Recall_val={recall:.4f}  thr={thr:.2f}")
+
+        if recall > best_recall:
+            best_recall = recall
+            best_name = name
+            best_pipe = pipe
+            best_thr = thr
+
+    # --------------------------------------------------------
+    # CALIBRATION
+    # --------------------------------------------------------
+    print(f"\nRefitting & calibrating best model ({best_name}) ...")
+
+    X_cal = pd.concat([X_tr, X_val])
+    y_cal = pd.concat([y_tr, y_val])
+
+    base_pipe = best_pipe
+    clf = base_pipe.named_steps["clf"]
+
+    calibrated_clf = CalibratedClassifierCV(
+        clf,
+        method="sigmoid",
+        cv=5
+    )
+
+    final_pipe = Pipeline(
+        base_pipe.steps[:-1] + [("clf", calibrated_clf)]
+    )
+
+    final_pipe.fit(X_cal, y_cal)
+
+    # --------------------------------------------------------
+    # SAVE ARTIFACTS
+    # --------------------------------------------------------
+    joblib.dump(final_pipe, MODELS_DIR / "best_model.pkl")
+    with open(MODELS_DIR / "threshold.json", "w") as f:
+        json.dump({"threshold": best_thr, "model": best_name}, f)
+
+    print("\nSaved models/best_model.pkl")
+    print(f"Saved threshold.json (threshold={best_thr})")
+
+    # --------------------------------------------------------
+    # FINAL EVALUATION
+    # --------------------------------------------------------
+    probs_test = final_pipe.predict_proba(X_test)[:, 1]
+    preds_test = (probs_test >= best_thr).astype(int)
+
+    print("\n=== Final Holdout Evaluation ===")
+    print("AUC:       ", roc_auc_score(y_test, probs_test))
+    print("Accuracy:  ", accuracy_score(y_test, preds_test))
+    print("Precision: ", precision_score(y_test, preds_test))
+    print("Recall:    ", recall_score(y_test, preds_test))
+    print("F1:        ", f1_score(y_test, preds_test))
 
 if __name__ == "__main__":
-    train_and_save()
+    main()

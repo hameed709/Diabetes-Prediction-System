@@ -14,7 +14,7 @@ Machine learning model to predict diabetes based on patient health data.
 - Model training & evaluation
 
 ## Results
-Achieved XX% accuracy using classification algorithms.
+Achieved 77% accuracy using classification algorithms.
 
 ## How to Run
 1. Clone repo

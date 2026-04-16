@@ -1,48 +1,22 @@
-# Diabetes Prediction System (Final Year Project)
+# Diabetes Prediction System
 
-## Setup
-1. Clone repo and change directory:
-   ```
-   git clone <repo-url>
-   cd diabetes-prediction
-   ```
+## Overview
+Machine learning model to predict diabetes based on patient health data.
 
-2. Install dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
+## Tech Stack
+- Python
+- Scikit-learn
+- Pandas, NumPy, Matplotlib
 
-3. Put dataset CSV as `data/raw/pima_diabetes.csv` (Pima Indians Diabetes CSV with columns: Pregnancies, Glucose, BloodPressure, SkinThickness, Insulin, BMI, DiabetesPedigreeFunction, Age, Outcome)
+## Features
+- Data preprocessing
+- Feature engineering
+- Model training & evaluation
 
-## Steps
-1. Preprocess:
-   ```
-   python src/data_prep.py
-   ```
-2. Train models:
-   ```
-   python src/train_models.py
-   ```
-3. Evaluate:
-   ```
-   python src/evaluate.py
-   ```
-4. Explain:
-   ```
-   python src/explainability.py
-   ```
-5. Run app:
-   ```
-   streamlit run src/app_streamlit.py
-   ```
+## Results
+Achieved XX% accuracy using classification algorithms.
 
-## Docker
-```
-docker build -t diabetes-app .
-docker run -p 8501:8501 diabetes-app
-```
-
-## Deliverables
-- `models/` contains persisted models
-- `reports/figures` contains figures and model metrics
-- `reports/final_report.md` — fill with methodology and results
+## How to Run
+1. Clone repo
+2. Install requirements
+3. Run main file
